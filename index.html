@@ -104,7 +104,8 @@ function showAuth() { render(authPage()); }
 function showLobby() { render(lobbyPage()); }
 
 async function enterSession(sessionId) {
-  if (unsubSession) unsubSession();
+  if (!sessionId) return;
+  if (unsubSession) { unsubSession(); unsubSession = null; }
   currentSessionId = sessionId;
   unsubSession = onSnapshot(doc(db, "sessions", sessionId), snap => {
     if (!snap.exists()) { currentSession = null; showLobby(); return; }
@@ -115,18 +116,30 @@ async function enterSession(sessionId) {
     });
   });
 }
+window.enterSession = enterSession;
 
 async function prefetchUsers(uids) {
-  const missing = uids.filter(uid => uid !== "__extern__" && !allUsersCache[uid]);
+  const missing = uids.filter(uid => uid !== "__extern__" && !allUsersCache[uid] && !uid.startsWith("ghost_"));
   await Promise.all(missing.map(async uid => {
-    const snap = await getDoc(doc(db, "users", uid));
-    if (snap.exists()) allUsersCache[uid] = snap.data();
+    try {
+      const snap = await getDoc(doc(db, "users", uid));
+      if (snap.exists()) allUsersCache[uid] = snap.data();
+    } catch(e) { /* ignore permission errors for ghost users */ }
   }));
+  // Load ghost player names from session into cache
+  if (currentSession?.ghostPlayers) {
+    Object.entries(currentSession.ghostPlayers).forEach(([id, username]) => {
+      allUsersCache[id] = { username, ghost: true };
+    });
+  }
 }
 
 function uname(uid) {
   if (uid === "__extern__") return "Weitere Spieler";
-  return allUsersCache[uid]?.username || uid.substring(0,8);
+  if (allUsersCache[uid]) return allUsersCache[uid].username;
+  // Check ghost players stored in current session
+  if (currentSession?.ghostPlayers?.[uid]) return currentSession.ghostPlayers[uid];
+  return uid.substring(0,8);
 }
 
 // ── Render ────────────────────────────────────────────────────────────
@@ -201,8 +214,8 @@ function authPage() {
 
 function authForm(mode) {
   return `
-    ${mode==="register" ? `<div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>` : ""}
-    <div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" autocomplete="email" /></div>
+    <div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>
+    ${mode==="register" ? `<div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" autocomplete="email" /></div>` : ""}
     <div class="form-group"><label>Passwort</label><input id="f-password" type="password" placeholder="••••••" autocomplete="${mode==="login"?"current":"new"}-password" /></div>
     <div id="auth-error" class="alert alert-error" style="display:none"></div>
     <button class="btn btn-primary btn-full" onclick="doAuth('${mode}')">
@@ -226,7 +239,7 @@ window.doAuth = async (mode) => {
 
   const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = "flex"; };
 
-  if (!username || !password) return showErr("Bitte alle Felder ausfüllen.");
+  if (!username || !password) return showErr("Bitte Benutzername und Passwort eingeben.");
 
   if (mode === "register") {
     const email = emailEl?.value.trim();
@@ -237,34 +250,35 @@ window.doAuth = async (mode) => {
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       await updateProfile(cred.user, { displayName: username });
 
-      // Check if a ghost user with same username exists -> merge sessions
-      const ghostQ = query(collection(db, "users"), where("username","==",username), where("ghost","==",true));
-      const ghostSnap = await new Promise(res => onSnapshot(ghostQ, s => res(s), {once:true}));
-      if (!ghostSnap.empty) {
-        const ghostId = ghostSnap.docs[0].id;
-        // Find all sessions containing the ghost user and replace ghost ID with real user ID
-        const sessQ = query(collection(db, "sessions"), where("players","array-contains",ghostId));
-        const sessSnap = await new Promise(res => onSnapshot(sessQ, s => res(s), {once:true}));
-        for (const sessDoc of sessSnap.docs) {
-          const sess = sessDoc.data();
-          // Replace ghostId in players array
-          const newPlayers = sess.players.map(p => p === ghostId ? cred.user.uid : p);
-          // Replace ghostId in all game results
-          const newGames = (sess.games||[]).map(g => {
-            if (g.results && g.results[ghostId] !== undefined) {
-              const newResults = { ...g.results };
-              newResults[cred.user.uid] = newResults[ghostId];
-              delete newResults[ghostId];
-              return { ...g, results: newResults };
-            }
-            return g;
-          });
-          // Fix adminId if ghost was admin
-          const newAdmin = sess.adminId === ghostId ? cred.user.uid : sess.adminId;
-          await updateDoc(doc(db, "sessions", sessDoc.id), { players: newPlayers, games: newGames, adminId: newAdmin });
-        }
-        // Delete ghost user doc
-        await deleteDoc(doc(db, "users", ghostId));
+      // Check if any sessions have a ghost player with the same username -> merge
+      // Ghost players are stored in session.ghostPlayers map (no separate user doc)
+      const sessQ = query(collection(db, "sessions"), where("active", "==", true));
+      const sessSnap = await new Promise(res => { const u = onSnapshot(sessQ, s => { u(); res(s); }); });
+      for (const sessDoc of sessSnap.docs) {
+        const sess = sessDoc.data();
+        if (!sess.ghostPlayers) continue;
+        // Find ghost ID that matches this username
+        const ghostEntry = Object.entries(sess.ghostPlayers).find(([,gname]) => gname === username);
+        if (!ghostEntry) continue;
+        const [ghostId] = ghostEntry;
+        // Replace ghost in players array
+        const newPlayers = (sess.players||[]).map(p => p === ghostId ? cred.user.uid : p);
+        // Replace ghost in game results
+        const newGames = (sess.games||[]).map(g => {
+          if (g.results && g.results[ghostId] !== undefined) {
+            const newResults = { ...g.results };
+            newResults[cred.user.uid] = newResults[ghostId];
+            delete newResults[ghostId];
+            return { ...g, results: newResults };
+          }
+          return g;
+        });
+        const newAdmin = sess.adminId === ghostId ? cred.user.uid : sess.adminId;
+        const newGhostPlayers = { ...sess.ghostPlayers };
+        delete newGhostPlayers[ghostId];
+        await updateDoc(doc(db, "sessions", sessDoc.id), {
+          players: newPlayers, games: newGames, adminId: newAdmin, ghostPlayers: newGhostPlayers
+        });
       }
 
       await setDoc(doc(db, "users", cred.user.uid), { uid: cred.user.uid, username, email, createdAt: new Date().toISOString() });
@@ -273,13 +287,19 @@ window.doAuth = async (mode) => {
       return showErr("Fehler: " + e.message);
     }
   } else {
-    // Login with email
-    const email = document.getElementById("f-email")?.value.trim() || "";
-    if (!email) return showErr("Bitte E-Mail eingeben.");
+    // Login: look up email by username in Firestore, then sign in
     try {
+      const q = query(collection(db, "users"), where("username", "==", username));
+      const userSnap = await new Promise((res, rej) => {
+        const unsub = onSnapshot(q, s => { unsub(); res(s); }, rej);
+      });
+      if (userSnap.empty) return showErr("Benutzername nicht gefunden.");
+      const email = userSnap.docs[0].data().email;
+      if (!email) return showErr("Kein Login-Account für diesen Benutzernamen.");
       await signInWithEmailAndPassword(auth, email, password);
     } catch(e) {
-      return showErr("E-Mail oder Passwort falsch.");
+      if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") return showErr("Falsches Passwort.");
+      return showErr("Fehler beim Anmelden: " + e.message);
     }
   }
 };
@@ -722,12 +742,20 @@ async function commitResult(gameId, playerId, value) {
 
 window.assignExtern = async (gameId, sum) => {
   const s = currentSession;
+  if (!s) return;
+  const numSum = Number(sum);
   const games = (s.games||[]).map(g => {
     if (g.id !== gameId) return g;
-    return { ...g, results: { ...(g.results||{}), "__extern__": -sum } };
+    return { ...g, results: { ...(g.results||{}), "__extern__": parseFloat((-numSum).toFixed(2)) } };
   });
   const players = s.players.includes("__extern__") ? s.players : [...s.players, "__extern__"];
   await updateDoc(doc(db, "sessions", s.id), { games, players });
+};
+
+window.assignExternBtn = (btn) => {
+  const gameId = btn.getAttribute("data-gameid");
+  const sum = parseFloat(btn.getAttribute("data-sum"));
+  window.assignExtern(gameId, sum);
 };
 
 // ── Statistiken ───────────────────────────────────────────────────────
@@ -857,11 +885,14 @@ window.doImport = async () => {
   if (btn) { btn.textContent = "Wird importiert..."; btn.disabled = true; }
 
   try {
-    // For each player name: check if a real or ghost user with that name exists
+    // Map player names to IDs:
+    // 1. Check if a real registered user with that name exists -> use their ID
+    // 2. Otherwise create a ghost ID and store name in session's ghostPlayers map
+    const ghostPlayers = {}; // ghostId -> username (stored in session, no separate doc needed)
+    
     const playerIds = await Promise.all(importData.playerNames.map(async pname => {
       const trimmed = pname.trim();
       if (!trimmed) return null;
-      // Use getDocs-style via getDoc workaround: query then get first result
       const q2 = query(collection(db, "users"), where("username","==",trimmed));
       const snap = await new Promise((res, rej) => {
         const unsub = onSnapshot(q2, s => { unsub(); res(s); }, rej);
@@ -870,10 +901,10 @@ window.doImport = async () => {
         allUsersCache[snap.docs[0].id] = snap.docs[0].data();
         return snap.docs[0].id;
       }
-      // Create ghost user
-      const id = genId();
-      await setDoc(doc(db,"users",id), { uid:id, username:trimmed, ghost:true, createdAt:new Date().toISOString() });
-      allUsersCache[id] = { username: trimmed };
+      // Ghost: store in session document instead of writing separate user doc
+      const id = "ghost_" + genId();
+      ghostPlayers[id] = trimmed;
+      allUsersCache[id] = { username: trimmed, ghost: true };
       return id;
     }));
 
@@ -886,24 +917,23 @@ window.doImport = async () => {
       importData.playerNames.forEach((pname, i) => {
         if (playerIds[i]) results[playerIds[i]] = g.results[pname.trim()];
       });
-      // Try to parse date from CSV, fallback to now
       let dateStr = new Date().toISOString();
       if (g.date) {
         const parts = g.date.split(".");
         if (parts.length === 3) {
-          const parsed = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+          const parsed = new Date(`${parts[2]}-${parts[1].padStart(2,"0")}-${parts[0].padStart(2,"0")}`);
           if (!isNaN(parsed)) dateStr = parsed.toISOString();
         }
       }
       return { id:genId(), date:dateStr, results };
     });
 
-    // Ensure current user is in players list
     const allPlayers = [currentUser.uid, ...validPlayerIds.filter(id => id !== currentUser.uid)];
 
     await setDoc(doc(db,"sessions",sessId), {
       id:sessId, name:sessionName, code:genCode(), adminId:currentUser.uid,
-      players:allPlayers, games, createdAt:new Date().toISOString(), active:true
+      players:allPlayers, games, ghostPlayers,
+      createdAt:new Date().toISOString(), active:true
     });
 
     importData = null;
