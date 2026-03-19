@@ -222,8 +222,8 @@ function authPage() {
 
 function authForm(mode) {
   return `
-    <div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>
-    ${mode==="register" ? `<div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" autocomplete="email" /></div>` : ""}
+    ${mode==="register" ? `<div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>` : ""}
+    <div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" autocomplete="email" /></div>
     <div class="form-group"><label>Passwort</label><input id="f-password" type="password" placeholder="••••••" autocomplete="${mode==="login"?"current":"new"}-password" /></div>
     <div id="auth-error" class="alert alert-error" style="display:none"></div>
     <button class="btn btn-primary btn-full" onclick="doAuth('${mode}')">
@@ -240,14 +240,14 @@ window.switchAuthTab = (mode) => {
 
 window.doAuth = async (mode) => {
   const username = document.getElementById("f-username")?.value.trim();
+  const email    = document.getElementById("f-email")?.value.trim();
   const password = document.getElementById("f-password")?.value;
-  const emailEl  = document.getElementById("f-email");
   const errEl    = document.getElementById("auth-error");
   errEl.style.display = "none";
 
   const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = "flex"; };
 
-  if (!username || !password) return showErr("Bitte Benutzername und Passwort eingeben.");
+  if (!email || !password) return showErr("Bitte E-Mail und Passwort eingeben.");
 
   if (mode === "register") {
     const email = emailEl?.value.trim();
@@ -295,18 +295,12 @@ window.doAuth = async (mode) => {
       return showErr("Fehler: " + e.message);
     }
   } else {
-    // Login: look up email by username in Firestore, then sign in
+    // Login direkt mit E-Mail + Passwort (kein Firestore-Query nötig)
     try {
-      const q = query(collection(db, "users"), where("username", "==", username));
-      const userSnap = await new Promise((res, rej) => {
-        const unsub = onSnapshot(q, s => { unsub(); res(s); }, err => { unsub(); rej(err); });
-      });
-      if (userSnap.empty) return showErr("Benutzername nicht gefunden.");
-      const email = userSnap.docs[0].data().email;
-      if (!email) return showErr("Kein Login-Account für diesen Benutzernamen.");
       await signInWithEmailAndPassword(auth, email, password);
     } catch(e) {
-      if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") return showErr("Falsches Passwort.");
+      if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") return showErr("E-Mail oder Passwort falsch.");
+      if (e.code === "auth/user-not-found") return showErr("Kein Konto mit dieser E-Mail gefunden.");
       return showErr("Fehler beim Anmelden: " + e.message);
     }
   }
@@ -458,13 +452,43 @@ window.joinSession = async () => {
     if (snap.empty) { errEl.textContent = "Ungültiger Code oder Session nicht aktiv."; errEl.style.display="flex"; return; }
     const sessDoc = snap.docs[0];
     const sess = sessDoc.data();
+
+    // Already a real member -> just open
     if ((sess.players||[]).includes(currentUser.uid)) {
       closeModal("join-session-modal");
       enterSession(sessDoc.id);
       return;
     }
-    // Add user to session players list
-    await updateDoc(doc(db, "sessions", sessDoc.id), { players: arrayUnion(currentUser.uid) });
+
+    // Check if current user matches a ghost player in this session -> merge
+    const myUsername = allUsersCache[currentUser.uid]?.username || currentUser.displayName || "";
+    const ghostPlayers = sess.ghostPlayers || {};
+    const ghostEntry = Object.entries(ghostPlayers).find(([,gname]) => gname === myUsername);
+
+    if (ghostEntry) {
+      // Merge ghost -> real user
+      const [ghostId] = ghostEntry;
+      const newPlayers = (sess.players||[]).map(p => p === ghostId ? currentUser.uid : p);
+      const newGames = (sess.games||[]).map(g => {
+        if (g.results && g.results[ghostId] !== undefined) {
+          const r = { ...g.results };
+          r[currentUser.uid] = r[ghostId];
+          delete r[ghostId];
+          return { ...g, results: r };
+        }
+        return g;
+      });
+      const newAdmin = sess.adminId === ghostId ? currentUser.uid : sess.adminId;
+      const newGhostPlayers = { ...ghostPlayers };
+      delete newGhostPlayers[ghostId];
+      await updateDoc(doc(db, "sessions", sessDoc.id), {
+        players: newPlayers, games: newGames, adminId: newAdmin, ghostPlayers: newGhostPlayers
+      });
+    } else {
+      // New member, just add
+      await updateDoc(doc(db, "sessions", sessDoc.id), { players: arrayUnion(currentUser.uid) });
+    }
+
     closeModal("join-session-modal");
     enterSession(sessDoc.id);
   } catch(e) {
@@ -518,7 +542,7 @@ function uebersichtHTML() {
       <button class="btn btn-danger btn-sm" onclick="deleteSession()">Session löschen</button>
     </div>` : ""}
 
-    <div class="overview-grid">
+    <div style="display:grid;grid-template-columns:minmax(220px,280px) 1fr;gap:16px;margin-bottom:16px;align-items:start">
       <div class="card">
         <h3 class="card-title">🏆 Leaderboard</h3>
         <div class="leaderboard">
@@ -536,7 +560,7 @@ function uebersichtHTML() {
         <h3 class="card-title">📈 Verlauf (kumulativ)</h3>
         ${(s.games||[]).length === 0
           ? `<div class="empty-state">Noch keine Spiele vorhanden.</div>`
-          : `<div style="position:relative;height:250px"><canvas id="chart-canvas"></canvas></div>`
+          : `<div style="position:relative;height:320px"><canvas id="chart-canvas"></canvas></div>`
         }
       </div>
     </div>
@@ -587,7 +611,7 @@ function initChart() {
       if (v !== null && v !== undefined) cum += Number(v);
       return cum;
     });
-    return { label: uname(pid), data, borderColor: COLORS[i % COLORS.length], backgroundColor: COLORS[i%COLORS.length]+"22", borderWidth: 2, pointRadius: 3, tension: 0.3, fill: false };
+    return { label: uname(pid), data, borderColor: COLORS[i % COLORS.length], backgroundColor: COLORS[i%COLORS.length]+"18", borderWidth: 2.5, pointRadius: 4, pointHoverRadius: 7, tension: 0.25, fill: false };
   });
 
   const t = T();
@@ -597,10 +621,24 @@ function initChart() {
     data: { labels, datasets },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { labels: { color: t.textSub, font: { family: "DM Sans" } } }, tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw >= 0 ? "+" : ""}${Number(ctx.raw).toFixed(2)} CHF` } } },
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          position: "bottom",
+          labels: { color: t.textSub, font: { family: "DM Sans", size: 12 }, padding: 16, usePointStyle: true, pointStyleWidth: 10 }
+        },
+        tooltip: {
+          backgroundColor: t.card, borderColor: t.border, borderWidth: 1,
+          titleColor: t.text, bodyColor: t.textSub,
+          callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.raw >= 0 ? "+" : ""}${Number(ctx.raw).toFixed(2)} CHF` }
+        }
+      },
       scales: {
-        x: { ticks: { color: t.textMuted }, grid: { color: t.border } },
-        y: { ticks: { color: t.textMuted, callback: v => `${v} CHF` }, grid: { color: t.border } }
+        x: { ticks: { color: t.textMuted, font: { size: 11 } }, grid: { color: t.border + "88" } },
+        y: {
+          ticks: { color: t.textMuted, font: { size: 11 }, callback: v => `${v >= 0 ? "+" : ""}${v} CHF` },
+          grid: { color: t.border + "88" }
+        }
       }
     }
   });
@@ -631,8 +669,9 @@ window.deleteSession = async () => {
 function tabelleHTML() {
   const s = currentSession;
   const isAdmin = s.adminId === currentUser.uid;
+  // __extern__ is a silent corrector - not shown as a column
   const playerIds = (s.players||[]).filter(p => p !== "__extern__");
-  const allPids = [...playerIds, ...(s.players.includes("__extern__") ? ["__extern__"] : [])];
+  const allPids = [...playerIds]; // __extern__ excluded from visible table
 
   const totals = {};
   allPids.forEach(pid => {
@@ -656,7 +695,9 @@ function tabelleHTML() {
         </thead>
         <tbody>
           ${(s.games||[]).map((g,gi) => {
-            const sum = allPids.reduce((acc,pid)=>{ const v=g.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; },0);
+            // Include __extern__ in sum calculation even though it's not displayed
+            const allPidsWithExtern = [...allPids, ...( Object.keys(g.results||{}).includes("__extern__") ? ["__extern__"] : [] )];
+            const sum = allPidsWithExtern.reduce((acc,pid)=>{ const v=g.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; },0);
             const hasErr = Math.abs(sum) > 0.01;
             return `
             <tr class="${hasErr?"row-err":""}">
@@ -752,8 +793,9 @@ async function commitResult(gameId, playerId, value) {
 
   // Check sum for admin
   const updatedGame = games.find(g => g.id === gameId);
-  const allPids = [...(s.players||[]).filter(p=>p!=="__extern__"), ...(s.players.includes("__extern__")?["__extern__"]:[])];
-  const sum = allPids.reduce((acc,pid) => { const v=updatedGame.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; }, 0);
+  // Include __extern__ in sum check (it may be in results even if not in players array)
+  const allPidsForSum = [...new Set([...(s.players||[]).filter(p=>p!=="__extern__"), ...Object.keys(updatedGame.results||{})])];
+  const sum = allPidsForSum.reduce((acc,pid) => { const v=updatedGame.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; }, 0);
   if (s.adminId === currentUser.uid && Math.abs(sum) > 0.01) {
     const errEl = document.getElementById("table-error");
     if (errEl) {
@@ -767,12 +809,14 @@ window.assignExtern = async (gameId, sum) => {
   const s = currentSession;
   if (!s) return;
   const numSum = Number(sum);
+  // Store correction in results under __extern__ key
+  // __extern__ is NOT added to players array -> stays invisible in UI
   const games = (s.games||[]).map(g => {
     if (g.id !== gameId) return g;
     return { ...g, results: { ...(g.results||{}), "__extern__": parseFloat((-numSum).toFixed(2)) } };
   });
-  const players = s.players.includes("__extern__") ? s.players : [...s.players, "__extern__"];
-  await updateDoc(doc(db, "sessions", s.id), { games, players });
+  // Do NOT add __extern__ to players array - keep it invisible
+  await updateDoc(doc(db, "sessions", s.id), { games });
 };
 
 window.assignExternBtn = (btn) => {
@@ -1147,6 +1191,7 @@ applyTheme();
 
   /* ── Overview Grid ── */
   .overview-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 2fr; gap: 16px; margin-bottom: 16px; }
+  @media (max-width: 700px) { .overview-grid { grid-template-columns: 1fr; } }
   .leaderboard { display: flex; flex-direction: column; gap: 8px; }
   .lb-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface); border-radius: 8px; border: 1px solid var(--border); }
   .lb-first { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
