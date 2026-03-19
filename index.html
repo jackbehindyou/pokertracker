@@ -239,68 +239,85 @@ window.switchAuthTab = (mode) => {
 };
 
 window.doAuth = async (mode) => {
-  const username = document.getElementById("f-username")?.value.trim();
-  const email    = document.getElementById("f-email")?.value.trim();
-  const password = document.getElementById("f-password")?.value;
-  const errEl    = document.getElementById("auth-error");
+  const errEl = document.getElementById("auth-error");
   errEl.style.display = "none";
-
   const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = "flex"; };
 
-  if (!email || !password) return showErr("Bitte E-Mail und Passwort eingeben.");
+  const emailVal    = (document.getElementById("f-email")?.value || "").trim();
+  const passwordVal = (document.getElementById("f-password")?.value || "");
+  const usernameVal = (document.getElementById("f-username")?.value || "").trim();
 
   if (mode === "register") {
-    const email = emailEl?.value.trim();
-    if (!email) return showErr("Bitte E-Mail angeben.");
-    if (username.length < 3) return showErr("Benutzername min. 3 Zeichen.");
-    if (password.length < 6) return showErr("Passwort min. 6 Zeichen.");
+    // Validierung
+    if (!usernameVal) return showErr("Bitte Benutzernamen eingeben.");
+    if (usernameVal.length < 3) return showErr("Benutzername min. 3 Zeichen.");
+    if (!emailVal) return showErr("Bitte E-Mail eingeben.");
+    if (!passwordVal || passwordVal.length < 6) return showErr("Passwort min. 6 Zeichen.");
+
     try {
-      const cred = await createUserWithEmailAndPassword(auth, email, password);
-      await updateProfile(cred.user, { displayName: username });
+      // Firebase Auth Account erstellen
+      const cred = await createUserWithEmailAndPassword(auth, emailVal, passwordVal);
+      await updateProfile(cred.user, { displayName: usernameVal });
 
-      // Check if any sessions have a ghost player with the same username -> merge
-      // Ghost players are stored in session.ghostPlayers map (no separate user doc)
-      const sessQ = query(collection(db, "sessions"), where("active", "==", true));
-      const sessSnap = await new Promise(res => { const u = onSnapshot(sessQ, s => { u(); res(s); }); });
-      for (const sessDoc of sessSnap.docs) {
-        const sess = sessDoc.data();
-        if (!sess.ghostPlayers) continue;
-        // Find ghost ID that matches this username
-        const ghostEntry = Object.entries(sess.ghostPlayers).find(([,gname]) => gname === username);
-        if (!ghostEntry) continue;
-        const [ghostId] = ghostEntry;
-        // Replace ghost in players array
-        const newPlayers = (sess.players||[]).map(p => p === ghostId ? cred.user.uid : p);
-        // Replace ghost in game results
-        const newGames = (sess.games||[]).map(g => {
-          if (g.results && g.results[ghostId] !== undefined) {
-            const newResults = { ...g.results };
-            newResults[cred.user.uid] = newResults[ghostId];
-            delete newResults[ghostId];
-            return { ...g, results: newResults };
-          }
-          return g;
-        });
-        const newAdmin = sess.adminId === ghostId ? cred.user.uid : sess.adminId;
-        const newGhostPlayers = { ...sess.ghostPlayers };
-        delete newGhostPlayers[ghostId];
-        await updateDoc(doc(db, "sessions", sessDoc.id), {
-          players: newPlayers, games: newGames, adminId: newAdmin, ghostPlayers: newGhostPlayers
-        });
-      }
+      // Firestore User-Dokument anlegen
+      await setDoc(doc(db, "users", cred.user.uid), {
+        uid: cred.user.uid,
+        username: usernameVal,
+        email: emailVal,
+        createdAt: new Date().toISOString()
+      });
 
-      await setDoc(doc(db, "users", cred.user.uid), { uid: cred.user.uid, username, email, createdAt: new Date().toISOString() });
+      // Ghost-Spieler mergen: Sessions suchen wo Ghost mit gleichem Namen existiert
+      try {
+        const sessQ = query(collection(db, "sessions"), where("active", "==", true));
+        const sessSnap = await new Promise((res, rej) => {
+          const u = onSnapshot(sessQ, s => { u(); res(s); }, rej);
+        });
+        for (const sessDoc of sessSnap.docs) {
+          const sess = sessDoc.data();
+          if (!sess.ghostPlayers) continue;
+          const ghostEntry = Object.entries(sess.ghostPlayers).find(([, gname]) => gname === usernameVal);
+          if (!ghostEntry) continue;
+          const [ghostId] = ghostEntry;
+          const newPlayers = (sess.players || []).map(p => p === ghostId ? cred.user.uid : p);
+          const newGames = (sess.games || []).map(g => {
+            if (g.results && g.results[ghostId] !== undefined) {
+              const r = { ...g.results };
+              r[cred.user.uid] = r[ghostId];
+              delete r[ghostId];
+              return { ...g, results: r };
+            }
+            return g;
+          });
+          const newGhosts = { ...sess.ghostPlayers };
+          delete newGhosts[ghostId];
+          await updateDoc(doc(db, "sessions", sessDoc.id), {
+            players: newPlayers, games: newGames,
+            adminId: sess.adminId === ghostId ? cred.user.uid : sess.adminId,
+            ghostPlayers: newGhosts
+          });
+        }
+      } catch(mergeErr) { /* Ghost-Merge ist optional, nicht kritisch */ }
+
+      // onAuthStateChanged übernimmt ab hier automatisch -> showLobby()
+
     } catch(e) {
-      if (e.code === "auth/email-already-in-use") return showErr("E-Mail bereits registriert.");
-      return showErr("Fehler: " + e.message);
+      if (e.code === "auth/email-already-in-use") return showErr("Diese E-Mail ist bereits registriert.");
+      if (e.code === "auth/invalid-email") return showErr("Ungültige E-Mail-Adresse.");
+      return showErr("Fehler beim Registrieren: " + e.message);
     }
+
   } else {
-    // Login direkt mit E-Mail + Passwort (kein Firestore-Query nötig)
+    // LOGIN: direkt mit E-Mail + Passwort
+    if (!emailVal) return showErr("Bitte E-Mail eingeben.");
+    if (!passwordVal) return showErr("Bitte Passwort eingeben.");
     try {
-      await signInWithEmailAndPassword(auth, email, password);
+      await signInWithEmailAndPassword(auth, emailVal, passwordVal);
+      // onAuthStateChanged übernimmt -> showLobby()
     } catch(e) {
-      if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") return showErr("E-Mail oder Passwort falsch.");
-      if (e.code === "auth/user-not-found") return showErr("Kein Konto mit dieser E-Mail gefunden.");
+      if (e.code === "auth/invalid-credential" || e.code === "auth/wrong-password" || e.code === "auth/user-not-found") {
+        return showErr("E-Mail oder Passwort falsch.");
+      }
       return showErr("Fehler beim Anmelden: " + e.message);
     }
   }
