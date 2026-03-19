@@ -61,6 +61,7 @@ let currentUser = null;
 let currentSession = null;
 let currentSessionId = null;
 let unsubSession = null;
+let unsubLobby = null;
 let allUsersCache = {};
 let chartInstance = null;
 
@@ -87,9 +88,10 @@ function applyTheme() {
 onAuthStateChanged(auth, async user => {
   if (user) {
     currentUser = user;
-    const snap = await getDoc(doc(db, "users", user.uid));
-    if (snap.exists()) allUsersCache[user.uid] = snap.data();
-    // Always go to lobby - user picks session themselves
+    try {
+      const snap = await getDoc(doc(db, "users", user.uid));
+      if (snap.exists()) allUsersCache[user.uid] = snap.data();
+    } catch(e) { /* doc may not exist yet on first login */ }
     showLobby();
   } else {
     currentUser = null;
@@ -101,10 +103,16 @@ onAuthStateChanged(auth, async user => {
 
 // ── Pages ─────────────────────────────────────────────────────────────
 function showAuth() { render(authPage()); }
-function showLobby() { render(lobbyPage()); }
+function showLobby() {
+  // Cancel old lobby listener before re-rendering
+  if (unsubLobby) { unsubLobby(); unsubLobby = null; }
+  render(lobbyPage());
+}
 
 async function enterSession(sessionId) {
   if (!sessionId) return;
+  // Cancel lobby listener so it can't redirect us back to lobby
+  if (unsubLobby) { unsubLobby(); unsubLobby = null; }
   if (unsubSession) { unsubSession(); unsubSession = null; }
   currentSessionId = sessionId;
   unsubSession = onSnapshot(doc(db, "sessions", sessionId), snap => {
@@ -291,7 +299,7 @@ window.doAuth = async (mode) => {
     try {
       const q = query(collection(db, "users"), where("username", "==", username));
       const userSnap = await new Promise((res, rej) => {
-        const unsub = onSnapshot(q, s => { unsub(); res(s); }, rej);
+        const unsub = onSnapshot(q, s => { unsub(); res(s); }, err => { unsub(); rej(err); });
       });
       if (userSnap.empty) return showErr("Benutzername nicht gefunden.");
       const email = userSnap.docs[0].data().email;
@@ -391,12 +399,17 @@ function lobbyPage() {
 async function loadMySessions() {
   const el = document.getElementById("my-sessions-section");
   if (!el) return;
-  // Listen to sessions where user is a player
   const q = query(collection(db, "sessions"), where("players", "array-contains", currentUser.uid));
-  onSnapshot(q, snap => {
-    const sessions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-    if (!sessions.length) { el.innerHTML = ""; return; }
-    el.innerHTML = `
+  // Store unsubscribe so enterSession can cancel it
+  unsubLobby = onSnapshot(q, snap => {
+    // If we've already navigated into a session, don't re-render lobby
+    if (currentSessionId) return;
+    const el2 = document.getElementById("my-sessions-section");
+    if (!el2) return;
+    const sessions = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .sort((a,b) => (b.createdAt||"").localeCompare(a.createdAt||""));
+    if (!sessions.length) { el2.innerHTML = ""; return; }
+    el2.innerHTML = `
       <h2 class="section-title">Meine Sessions</h2>
       ${sessions.map(s => `
         <div class="card session-row">
@@ -412,6 +425,8 @@ async function loadMySessions() {
         </div>
       `).join("")}
     `;
+  }, err => {
+    console.warn("loadMySessions error:", err.message);
   });
 }
 
@@ -433,21 +448,29 @@ window.createSession = async () => {
 window.joinSession = async () => {
   const code = document.getElementById("jc-code")?.value.trim().toUpperCase();
   const errEl = document.getElementById("jc-error");
+  errEl.style.display = "none";
   if (!code) { errEl.textContent = "Bitte einen Code eingeben."; errEl.style.display="flex"; return; }
-  const q2 = query(collection(db, "sessions"), where("code", "==", code), where("active", "==", true));
-  const snap = await new Promise(res => onSnapshot(q2, s => res(s), { once: true }));
-  if (snap.empty) { errEl.textContent = "Ungültiger Code oder Session nicht aktiv."; errEl.style.display="flex"; return; }
-  const sessDoc = snap.docs[0];
-  const sess = sessDoc.data();
-  if ((sess.players||[]).includes(currentUser.uid)) {
-    // Already in session - just open it
+  try {
+    const q2 = query(collection(db, "sessions"), where("code", "==", code), where("active", "==", true));
+    const snap = await new Promise((res, rej) => {
+      const unsub = onSnapshot(q2, s => { unsub(); res(s); }, rej);
+    });
+    if (snap.empty) { errEl.textContent = "Ungültiger Code oder Session nicht aktiv."; errEl.style.display="flex"; return; }
+    const sessDoc = snap.docs[0];
+    const sess = sessDoc.data();
+    if ((sess.players||[]).includes(currentUser.uid)) {
+      closeModal("join-session-modal");
+      enterSession(sessDoc.id);
+      return;
+    }
+    // Add user to session players list
+    await updateDoc(doc(db, "sessions", sessDoc.id), { players: arrayUnion(currentUser.uid) });
     closeModal("join-session-modal");
     enterSession(sessDoc.id);
-    return;
+  } catch(e) {
+    errEl.textContent = "Fehler: " + e.message;
+    errEl.style.display = "flex";
   }
-  await updateDoc(doc(db, "sessions", sessDoc.id), { players: arrayUnion(currentUser.uid) });
-  closeModal("join-session-modal");
-  enterSession(sessDoc.id);
 };
 
 window.leaveSession = () => {
