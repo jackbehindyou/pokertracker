@@ -1,0 +1,1101 @@
+<!DOCTYPE html>
+
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PokerTracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;800;900&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+<!-- ═══════════════════════════════════════════════════════════
+     🔧 FIREBASE KONFIGURATION – NUR HIER ANPASSEN
+     Ersetze die Werte unten mit deinen Firebase-Projektdaten.
+     Anleitung: siehe README am Ende der Seite (Konsole öffnen)
+════════════════════════════════════════════════════════════ -->
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, doc, setDoc, getDoc, updateDoc, deleteDoc, collection, query, where, onSnapshot, arrayUnion, arrayRemove, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDEFQfl3KOPUbwNM53sXQg5C83lisg7PyU",
+  authDomain: "pokerstats-b9ed3.firebaseapp.com",
+  projectId: "pokerstats-b9ed3",
+  storageBucket: "pokerstats-b9ed3.firebasestorage.app",
+  messagingSenderId: "904787779019",
+  appId: "1:904787779019:web:9430e4c0155293febd2a4e",
+  measurementId: "G-KRKB1G1CWE"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// ── Helpers ──────────────────────────────────────────────────────────
+const genCode = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+const genId   = () => Math.random().toString(36).substring(2, 14);
+const fmt     = n => n === null || n === undefined ? "–" : (n >= 0 ? `+${Number(n).toFixed(2)}` : Number(n).toFixed(2)) + " CHF";
+const fmtDate = iso => new Date(iso).toLocaleDateString("de-CH", { day:"2-digit", month:"2-digit", year:"numeric" });
+
+// ── Theme ─────────────────────────────────────────────────────────────
+let darkMode = localStorage.getItem("pk_dark") !== "false";
+const T = () => darkMode ? {
+  bg:"#0c0e13", surface:"#13161e", card:"#1a1e28", border:"#252b3a",
+  accent:"#c9a84c", accentD:"#a07830", accentSoft:"#c9a84c18",
+  text:"#e8e0d0", textMuted:"#5a6070", textSub:"#8a90a0",
+  red:"#e05555", green:"#4caf7a", blue:"#5b8dee",
+  shadow:"0 4px 24px #00000060"
+} : {
+  bg:"#f4efe6", surface:"#ede7dc", card:"#fdf7ee", border:"#d8ceC0",
+  accent:"#8b6010", accentD:"#6a4a0c", accentSoft:"#8b601018",
+  text:"#1a1208", textMuted:"#7a6f5a", textSub:"#5a5040",
+  red:"#c0392b", green:"#1e7a45", blue:"#1d4ed8",
+  shadow:"0 4px 24px #00000018"
+};
+
+// ── State ─────────────────────────────────────────────────────────────
+let currentUser = null;
+let currentSession = null;
+let currentSessionId = null;
+let unsubSession = null;
+let allUsersCache = {};
+let chartInstance = null;
+
+// ── CSS ───────────────────────────────────────────────────────────────
+function applyTheme() {
+  const t = T();
+  document.documentElement.style.setProperty("--bg", t.bg);
+  document.documentElement.style.setProperty("--surface", t.surface);
+  document.documentElement.style.setProperty("--card", t.card);
+  document.documentElement.style.setProperty("--border", t.border);
+  document.documentElement.style.setProperty("--accent", t.accent);
+  document.documentElement.style.setProperty("--accent-d", t.accentD);
+  document.documentElement.style.setProperty("--accent-soft", t.accentSoft);
+  document.documentElement.style.setProperty("--text", t.text);
+  document.documentElement.style.setProperty("--muted", t.textMuted);
+  document.documentElement.style.setProperty("--sub", t.textSub);
+  document.documentElement.style.setProperty("--red", t.red);
+  document.documentElement.style.setProperty("--green", t.green);
+  document.documentElement.style.setProperty("--blue", t.blue);
+  document.documentElement.style.setProperty("--shadow", t.shadow);
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────
+onAuthStateChanged(auth, async user => {
+  if (user) {
+    currentUser = user;
+    // Cache user profile
+    const snap = await getDoc(doc(db, "users", user.uid));
+    if (snap.exists()) allUsersCache[user.uid] = snap.data();
+    // Check if in a session
+    const sessSnap = await getDoc(doc(db, "users", user.uid));
+    const activeSession = sessSnap.exists() ? sessSnap.data().activeSession : null;
+    if (activeSession) {
+      enterSession(activeSession);
+    } else {
+      showLobby();
+    }
+  } else {
+    currentUser = null;
+    currentSession = null;
+    currentSessionId = null;
+    showAuth();
+  }
+});
+
+// ── Pages ─────────────────────────────────────────────────────────────
+function showAuth() { render(authPage()); }
+function showLobby() { render(lobbyPage()); }
+
+async function enterSession(sessionId) {
+  if (unsubSession) unsubSession();
+  currentSessionId = sessionId;
+  unsubSession = onSnapshot(doc(db, "sessions", sessionId), snap => {
+    if (!snap.exists()) { currentSession = null; showLobby(); return; }
+    currentSession = { id: snap.id, ...snap.data() };
+    prefetchUsers(currentSession.players || []).then(() => {
+      const tab = document.querySelector(".tab-btn.active")?.dataset?.tab || "uebersicht";
+      renderSessionShell(tab);
+    });
+  });
+}
+
+async function prefetchUsers(uids) {
+  const missing = uids.filter(uid => uid !== "__extern__" && !allUsersCache[uid]);
+  await Promise.all(missing.map(async uid => {
+    const snap = await getDoc(doc(db, "users", uid));
+    if (snap.exists()) allUsersCache[uid] = snap.data();
+  }));
+}
+
+function uname(uid) {
+  if (uid === "__extern__") return "Weitere Spieler";
+  return allUsersCache[uid]?.username || uid.substring(0,8);
+}
+
+// ── Render ────────────────────────────────────────────────────────────
+function render(html) {
+  document.getElementById("app").innerHTML = html;
+  bindEvents();
+}
+
+function renderSessionShell(tab = "uebersicht") {
+  const s = currentSession;
+  const isAdmin = s.adminId === currentUser.uid;
+  document.getElementById("app").innerHTML = `
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="logo-sm">🃏</span>
+        <div>
+          <span class="session-title">${esc(s.name)}</span>
+          <span class="session-code">Code: <strong>${s.code}</strong></span>
+        </div>
+        ${isAdmin ? '<span class="badge">Admin</span>' : ""}
+        ${!s.active ? '<span class="badge badge-red">Beendet</span>' : ""}
+      </div>
+      <div class="topbar-right">
+        <span class="username-label">${esc(uname(currentUser.uid))}</span>
+        <button class="btn btn-muted btn-sm" onclick="toggleDark()">🌙</button>
+        <button class="btn btn-muted btn-sm" onclick="leaveSession()">← Zurück</button>
+      </div>
+    </div>
+    <div class="tabs">
+      ${[["uebersicht","📊 Übersicht"],["tabelle","📋 Tabelle"],["statistiken","🏆 Statistiken"]].map(([k,l]) =>
+        `<button class="tab-btn${tab===k?" active":""}" data-tab="${k}" onclick="switchTab('${k}')">${l}</button>`
+      ).join("")}
+    </div>
+    <div class="tab-content" id="tab-content">
+      ${tab==="uebersicht" ? uebersichtHTML() : tab==="tabelle" ? tabelleHTML() : statistikenHTML()}
+    </div>
+  `;
+  if (tab === "uebersicht") initChart();
+  bindSessionEvents();
+}
+
+function switchTab(tab) {
+  if (chartInstance) { chartInstance.destroy(); chartInstance = null; }
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  document.getElementById("tab-content").innerHTML =
+    tab==="uebersicht" ? uebersichtHTML() : tab==="tabelle" ? tabelleHTML() : statistikenHTML();
+  if (tab === "uebersicht") initChart();
+  bindSessionEvents();
+}
+window.switchTab = switchTab;
+
+// ── Auth Page ─────────────────────────────────────────────────────────
+function authPage() {
+  return `
+  <div class="auth-wrap">
+    <div class="auth-box">
+      <div class="auth-logo">
+        <div class="logo-icon">🃏</div>
+        <h1 class="logo-text">PokerTracker</h1>
+        <p class="logo-sub">Behalte den Überblick beim nächsten Spieleabend</p>
+      </div>
+      <div class="tab-switch">
+        <button class="ts-btn active" id="ts-login" onclick="switchAuthTab('login')">Anmelden</button>
+        <button class="ts-btn" id="ts-register" onclick="switchAuthTab('register')">Registrieren</button>
+      </div>
+      <div id="auth-form">
+        ${authForm("login")}
+      </div>
+    </div>
+  </div>`;
+}
+
+function authForm(mode) {
+  return `
+    <div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>
+    ${mode==="register" ? `<div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" /></div>` : ""}
+    <div class="form-group"><label>Passwort</label><input id="f-password" type="password" placeholder="••••••" autocomplete="${mode==="login"?"current":"new"}-password" /></div>
+    <div id="auth-error" class="alert alert-error" style="display:none"></div>
+    <button class="btn btn-primary btn-full" onclick="doAuth('${mode}')">
+      ${mode==="login" ? "Anmelden" : "Konto erstellen"}
+    </button>
+  `;
+}
+
+window.switchAuthTab = (mode) => {
+  document.getElementById("ts-login").classList.toggle("active", mode==="login");
+  document.getElementById("ts-register").classList.toggle("active", mode==="register");
+  document.getElementById("auth-form").innerHTML = authForm(mode);
+};
+
+window.doAuth = async (mode) => {
+  const username = document.getElementById("f-username")?.value.trim();
+  const password = document.getElementById("f-password")?.value;
+  const emailEl  = document.getElementById("f-email");
+  const errEl    = document.getElementById("auth-error");
+  errEl.style.display = "none";
+
+  const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = "flex"; };
+
+  if (!username || !password) return showErr("Bitte alle Felder ausfüllen.");
+
+  if (mode === "register") {
+    const email = emailEl?.value.trim();
+    if (!email) return showErr("Bitte E-Mail angeben.");
+    if (username.length < 3) return showErr("Benutzername min. 3 Zeichen.");
+    if (password.length < 6) return showErr("Passwort min. 6 Zeichen.");
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, password);
+      await updateProfile(cred.user, { displayName: username });
+      await setDoc(doc(db, "users", cred.user.uid), { uid: cred.user.uid, username, email, createdAt: new Date().toISOString(), activeSession: null });
+    } catch(e) {
+      if (e.code === "auth/email-already-in-use") return showErr("E-Mail bereits registriert.");
+      return showErr("Fehler: " + e.message);
+    }
+  } else {
+    // Login: find email by username
+    try {
+      const usersSnap = await new Promise((res) => {
+        const q = query(collection(db, "users"), where("username", "==", username));
+        onSnapshot(q, snap => res(snap), { once: true });
+      });
+      // Since we can't easily query by username on login without email,
+      // store email in local cache or require email
+      // Workaround: ask for email on login too if username not found
+      const email = prompt(`E-Mail für "${username}":`) || "";
+      await signInWithEmailAndPassword(auth, email, password);
+    } catch(e) {
+      return showErr("Benutzername oder Passwort falsch.");
+    }
+  }
+};
+
+// ── Lobby ─────────────────────────────────────────────────────────────
+function lobbyPage() {
+  return `
+  <div class="page-wrap">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="logo-sm">🃏</span>
+        <span class="logo-text-sm">PokerTracker</span>
+      </div>
+      <div class="topbar-right">
+        <span class="username-label">${esc(uname(currentUser.uid))}</span>
+        <button class="btn btn-muted btn-sm" onclick="toggleDark()">🌙</button>
+        <button class="btn btn-muted btn-sm" onclick="doLogout()">Abmelden</button>
+      </div>
+    </div>
+    <div class="lobby-content">
+      <div class="lobby-grid">
+        <div class="card lobby-card" onclick="showModal('create-session-modal')">
+          <div class="lobby-icon">➕</div>
+          <h3>Session erstellen</h3>
+          <p>Neue Runde starten und Freunde einladen</p>
+          <button class="btn btn-primary btn-sm" style="margin-top:12px">Erstellen</button>
+        </div>
+        <div class="card lobby-card" onclick="showModal('join-session-modal')">
+          <div class="lobby-icon">🔗</div>
+          <h3>Session beitreten</h3>
+          <p>Mit Code einer laufenden Session beitreten</p>
+          <button class="btn btn-ghost btn-sm" style="margin-top:12px">Beitreten</button>
+        </div>
+      </div>
+      <div style="margin-bottom:20px">
+        <button class="btn btn-muted btn-sm" onclick="showModal('import-modal')">📥 Daten importieren (CSV)</button>
+      </div>
+      <div id="my-sessions-section"></div>
+    </div>
+  </div>
+
+  <!-- Create Session Modal -->
+  <div class="modal-overlay" id="create-session-modal" style="display:none">
+    <div class="modal">
+      <div class="modal-header"><h2>Neue Session</h2><button onclick="closeModal('create-session-modal')">✕</button></div>
+      <div class="form-group"><label>Session-Name</label><input id="cs-name" type="text" placeholder="z.B. Freitagsrunde" /></div>
+      <div id="cs-error" class="alert alert-error" style="display:none"></div>
+      <div class="modal-actions">
+        <button class="btn btn-muted" onclick="closeModal('create-session-modal')">Abbrechen</button>
+        <button class="btn btn-primary" onclick="createSession()">Erstellen</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Join Session Modal -->
+  <div class="modal-overlay" id="join-session-modal" style="display:none">
+    <div class="modal">
+      <div class="modal-header"><h2>Session beitreten</h2><button onclick="closeModal('join-session-modal')">✕</button></div>
+      <div class="form-group"><label>Session-Code</label><input id="jc-code" type="text" placeholder="ABC123" style="text-transform:uppercase;letter-spacing:3px" /></div>
+      <div id="jc-error" class="alert alert-error" style="display:none"></div>
+      <div class="modal-actions">
+        <button class="btn btn-muted" onclick="closeModal('join-session-modal')">Abbrechen</button>
+        <button class="btn btn-primary" onclick="joinSession()">Beitreten</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Import Modal -->
+  <div class="modal-overlay" id="import-modal" style="display:none">
+    <div class="modal modal-wide">
+      <div class="modal-header"><h2>📥 Daten importieren (CSV)</h2><button onclick="closeModal('import-modal')">✕</button></div>
+      <div class="alert alert-warning">
+        Format: Erste Spalte = Datum, weitere Spalten = Spielernamen.<br>
+        <button onclick="downloadTemplate()" class="link-btn" style="margin-top:6px">📥 Template herunterladen</button>
+      </div>
+      <div class="form-group" style="margin-top:14px"><label>Session-Name</label><input id="imp-name" type="text" placeholder="Import – Alte Runden" /></div>
+      <div class="form-group"><label>CSV-Datei</label><input id="imp-file" type="file" accept=".csv,.txt" onchange="previewImport()" /></div>
+      <div id="imp-preview"></div>
+      <div id="imp-error" class="alert alert-error" style="display:none"></div>
+      <div class="modal-actions">
+        <button class="btn btn-muted" onclick="closeModal('import-modal')">Abbrechen</button>
+        <button class="btn btn-primary" onclick="doImport()">Importieren</button>
+      </div>
+    </div>
+  </div>
+  `;
+}
+
+async function loadMySessions() {
+  const el = document.getElementById("my-sessions-section");
+  if (!el) return;
+  // Listen to sessions where user is a player
+  const q = query(collection(db, "sessions"), where("players", "array-contains", currentUser.uid));
+  onSnapshot(q, snap => {
+    const sessions = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    if (!sessions.length) { el.innerHTML = ""; return; }
+    el.innerHTML = `
+      <h2 class="section-title">Meine Sessions</h2>
+      ${sessions.map(s => `
+        <div class="card session-row">
+          <div class="session-row-info">
+            <div class="session-row-name">
+              ${esc(s.name)}
+              ${s.adminId === currentUser.uid ? '<span class="badge">Admin</span>' : ""}
+              ${!s.active ? '<span class="badge badge-red">Beendet</span>' : ""}
+            </div>
+            <div class="session-row-meta">Code: <strong>${s.code}</strong> · ${(s.players||[]).filter(p=>p!=="__extern__").length} Spieler · ${(s.games||[]).length} Spiele</div>
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="enterSession('${s.id}')">Öffnen →</button>
+        </div>
+      `).join("")}
+    `;
+  });
+}
+
+// ── Session Actions ───────────────────────────────────────────────────
+window.createSession = async () => {
+  const name = document.getElementById("cs-name")?.value.trim();
+  const errEl = document.getElementById("cs-error");
+  if (!name) { errEl.textContent = "Bitte einen Namen eingeben."; errEl.style.display="flex"; return; }
+  const userDoc = await getDoc(doc(db, "users", currentUser.uid));
+  if (userDoc.data()?.activeSession) { errEl.textContent = "Du bist bereits in einer Session."; errEl.style.display="flex"; return; }
+  const id = genId();
+  const code = genCode();
+  await setDoc(doc(db, "sessions", id), {
+    id, name, code, adminId: currentUser.uid, players: [currentUser.uid],
+    games: [], createdAt: new Date().toISOString(), active: true
+  });
+  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: id });
+  closeModal("create-session-modal");
+  enterSession(id);
+};
+
+window.joinSession = async () => {
+  const code = document.getElementById("jc-code")?.value.trim().toUpperCase();
+  const errEl = document.getElementById("jc-error");
+  const userDoc = await getDoc(doc(db, "users", currentUser.uid));
+  if (userDoc.data()?.activeSession) { errEl.textContent = "Du bist bereits in einer Session. Verlasse sie zuerst."; errEl.style.display="flex"; return; }
+  const q2 = query(collection(db, "sessions"), where("code", "==", code), where("active", "==", true));
+  const snap = await new Promise(res => onSnapshot(q2, s => res(s), { once: true }));
+  if (snap.empty) { errEl.textContent = "Ungültiger Code oder Session nicht aktiv."; errEl.style.display="flex"; return; }
+  const sessDoc = snap.docs[0];
+  const sess = sessDoc.data();
+  if ((sess.players||[]).includes(currentUser.uid)) { errEl.textContent = "Du bist bereits in dieser Session."; errEl.style.display="flex"; return; }
+  await updateDoc(doc(db, "sessions", sessDoc.id), { players: arrayUnion(currentUser.uid) });
+  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: sessDoc.id });
+  closeModal("join-session-modal");
+  enterSession(sessDoc.id);
+};
+
+window.leaveSession = async () => {
+  if (unsubSession) { unsubSession(); unsubSession = null; }
+  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: null });
+  currentSession = null; currentSessionId = null;
+  showLobby();
+};
+
+window.doLogout = async () => {
+  if (unsubSession) { unsubSession(); unsubSession = null; }
+  await signOut(auth);
+};
+
+// ── Übersicht ─────────────────────────────────────────────────────────
+function uebersichtHTML() {
+  const s = currentSession;
+  const isAdmin = s.adminId === currentUser.uid;
+  const playerIds = (s.players||[]).filter(p => p !== "__extern__");
+
+  // Leaderboard
+  const leaderboard = playerIds.map(pid => ({
+    id: pid, name: uname(pid),
+    total: (s.games||[]).reduce((acc, g) => {
+      const v = g.results?.[pid]; return v !== null && v !== undefined ? acc + Number(v) : acc;
+    }, 0)
+  })).sort((a,b) => b.total - a.total);
+
+  return `
+    ${isAdmin && s.active ? `
+    <div class="card admin-bar">
+      <div>
+        <div class="admin-bar-title">Admin-Steuerung</div>
+        <div class="admin-bar-sub">Session-Code: <strong class="code-pill">${s.code}</strong> – teile diesen Code mit Freunden</div>
+      </div>
+      <div class="admin-bar-actions">
+        <button class="btn btn-primary btn-sm" onclick="addGame()">➕ Neues Spiel</button>
+        <button class="btn btn-danger btn-sm" onclick="showModal('end-session-modal')">Session beenden</button>
+      </div>
+    </div>` : ""}
+
+    ${!s.active && isAdmin ? `
+    <div class="card" style="margin-bottom:16px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <div style="flex:1;color:var(--muted)">Session ist beendet.</div>
+      <button class="btn btn-muted btn-sm" onclick="exportCSV()">📥 CSV exportieren</button>
+      <button class="btn btn-danger btn-sm" onclick="deleteSession()">Session löschen</button>
+    </div>` : ""}
+
+    <div class="overview-grid">
+      <div class="card">
+        <h3 class="card-title">🏆 Leaderboard</h3>
+        <div class="leaderboard">
+          ${leaderboard.map((p,i) => `
+            <div class="lb-row ${i===0?"lb-first":""}">
+              <span class="lb-rank">${["🥇","🥈","🥉"][i]||`${i+1}.`}</span>
+              <span class="lb-name">${esc(p.name)}</span>
+              <span class="lb-val ${p.total>=0?"val-pos":"val-neg"}">${fmt(p.total)}</span>
+            </div>
+          `).join("")}
+          ${leaderboard.length===0?"<p style='color:var(--muted);text-align:center;padding:20px'>Noch keine Spieler</p>":""}
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card-title">📈 Verlauf (kumulativ)</h3>
+        ${(s.games||[]).length === 0
+          ? `<div class="empty-state">Noch keine Spiele vorhanden.</div>`
+          : `<div style="position:relative;height:250px"><canvas id="chart-canvas"></canvas></div>`
+        }
+      </div>
+    </div>
+
+    ${(s.games||[]).length > 0 ? `
+    <div class="card" style="margin-top:16px">
+      <h3 class="card-title">Letzte Spiele</h3>
+      ${[...(s.games||[])].reverse().slice(0,5).map((g,i) => {
+        const allP = [...playerIds, ...(s.players.includes("__extern__")?["__extern__"]:[])];
+        const sum = allP.reduce((acc,pid) => { const v=g.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; }, 0);
+        const filled = Object.keys(g.results||{}).filter(k => g.results[k]!==null&&g.results[k]!==undefined).length;
+        return `
+        <div class="recent-row">
+          <span class="recent-date">${fmtDate(g.date)}</span>
+          <span class="recent-info">${filled} Einträge</span>
+          ${Math.abs(sum)>0.01 ? `<span class="badge badge-red">Differenz: ${sum.toFixed(2)} CHF</span>` : '<span class="badge badge-green">✓ Ausgeglichen</span>'}
+        </div>`;
+      }).join("")}
+    </div>` : ""}
+
+    <!-- End Session Modal -->
+    <div class="modal-overlay" id="end-session-modal" style="display:none">
+      <div class="modal">
+        <div class="modal-header"><h2>Session beenden</h2><button onclick="closeModal('end-session-modal')">✕</button></div>
+        <p style="color:var(--sub);margin-bottom:8px">Die Daten werden als CSV exportiert, bevor die Session beendet wird.</p>
+        <p style="color:var(--red);font-size:13px;margin-bottom:20px">⚠️ Beendete Sessions können nicht wieder geöffnet werden.</p>
+        <div class="modal-actions">
+          <button class="btn btn-muted" onclick="closeModal('end-session-modal')">Abbrechen</button>
+          <button class="btn btn-danger" onclick="endSession()">Beenden & exportieren</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function initChart() {
+  const s = currentSession;
+  const canvas = document.getElementById("chart-canvas");
+  if (!canvas || !s) return;
+  const playerIds = (s.players||[]).filter(p => p !== "__extern__");
+  const COLORS = ["#c9a84c","#5b8dee","#4caf7a","#e05555","#a78bfa","#fb923c","#22d3ee","#f472b6"];
+
+  const labels = (s.games||[]).map((_,i) => `S${i+1}`);
+  const datasets = playerIds.map((pid, i) => {
+    let cum = 0;
+    const data = (s.games||[]).map(g => {
+      const v = g.results?.[pid];
+      if (v !== null && v !== undefined) cum += Number(v);
+      return cum;
+    });
+    return { label: uname(pid), data, borderColor: COLORS[i % COLORS.length], backgroundColor: COLORS[i%COLORS.length]+"22", borderWidth: 2, pointRadius: 3, tension: 0.3, fill: false };
+  });
+
+  const t = T();
+  if (chartInstance) chartInstance.destroy();
+  chartInstance = new Chart(canvas, {
+    type: "line",
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: t.textSub, font: { family: "DM Sans" } } }, tooltip: { callbacks: { label: ctx => `${ctx.dataset.label}: ${ctx.raw >= 0 ? "+" : ""}${Number(ctx.raw).toFixed(2)} CHF` } } },
+      scales: {
+        x: { ticks: { color: t.textMuted }, grid: { color: t.border } },
+        y: { ticks: { color: t.textMuted, callback: v => `${v} CHF` }, grid: { color: t.border } }
+      }
+    }
+  });
+}
+
+window.addGame = async () => {
+  const s = currentSession;
+  if (!s || !s.active) return;
+  const newGame = { id: genId(), date: new Date().toISOString(), results: {} };
+  await updateDoc(doc(db, "sessions", s.id), { games: [...(s.games||[]), newGame] });
+};
+
+window.endSession = async () => {
+  exportCSV();
+  await updateDoc(doc(db, "sessions", currentSessionId), { active: false });
+  closeModal("end-session-modal");
+};
+
+window.deleteSession = async () => {
+  if (!confirm("Session wirklich löschen? Alle Daten gehen verloren.")) return;
+  if (unsubSession) { unsubSession(); unsubSession = null; }
+  await deleteDoc(doc(db, "sessions", currentSessionId));
+  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: null });
+  currentSession = null; currentSessionId = null;
+  showLobby();
+};
+
+// ── Tabelle ───────────────────────────────────────────────────────────
+function tabelleHTML() {
+  const s = currentSession;
+  const isAdmin = s.adminId === currentUser.uid;
+  const playerIds = (s.players||[]).filter(p => p !== "__extern__");
+  const allPids = [...playerIds, ...(s.players.includes("__extern__") ? ["__extern__"] : [])];
+
+  const totals = {};
+  allPids.forEach(pid => {
+    totals[pid] = (s.games||[]).reduce((acc,g) => { const v=g.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; }, 0);
+  });
+
+  if (!s.games?.length) return `<div class="card"><div class="empty-state">${isAdmin ? "Erstelle ein neues Spiel über die Übersichtsseite." : "Der Admin hat noch kein Spiel gestartet."}</div></div>`;
+
+  return `
+  <div id="table-error"></div>
+  <div class="card table-card">
+    <div class="table-scroll">
+      <table class="results-table">
+        <thead>
+          <tr>
+            <th class="th-spiel">Spiel</th>
+            <th class="th-datum">Datum</th>
+            ${allPids.map(pid => `<th>${pid==="__extern__"?'<span class="muted-label">Weitere</span>':esc(uname(pid))}${pid===currentUser.uid?'<span class="badge-me">Ich</span>':""}</th>`).join("")}
+            <th>Summe</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${(s.games||[]).map((g,gi) => {
+            const sum = allPids.reduce((acc,pid)=>{ const v=g.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; },0);
+            const hasErr = Math.abs(sum) > 0.01;
+            return `
+            <tr class="${hasErr?"row-err":""}">
+              <td class="td-spiel">Spiel ${gi+1}</td>
+              <td class="td-date">${fmtDate(g.date)}</td>
+              ${allPids.map(pid => {
+                const val = g.results?.[pid];
+                const editable = s.active && pid !== "__extern__" && (isAdmin || pid === currentUser.uid);
+                const display = val===null||val===undefined ? '<span class="val-none">–</span>'
+                  : `<span class="${Number(val)>=0?"val-pos":"val-neg"}">${Number(val)>=0?"+":""}${Number(val).toFixed(2)}</span>`;
+                return `<td><div class="cell-wrap ${editable?"cell-editable":""}" onclick="${editable?`startEdit('${g.id}','${pid}',${val===null||val===undefined?"null":val})`:""}">
+                  <span id="cell-${g.id}-${pid}">${display}</span>
+                </div></td>`;
+              }).join("")}
+              <td class="td-sum">
+                ${hasErr
+                  ? `<div class="sum-err"><span class="badge badge-red">${sum>0?"+":""}${sum.toFixed(2)} CHF</span>${isAdmin?`<button class="link-btn" style="font-size:11px;margin-top:3px" onclick="assignExtern('${g.id}',${sum})">Ext. zuweisen</button>`:"" }</div>`
+                  : '<span class="badge badge-green">✓ 0.00</span>'}
+              </td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+        <tfoot>
+          <tr class="total-row">
+            <td colspan="2">TOTAL</td>
+            ${allPids.map(pid => `<td class="${totals[pid]>=0?"val-pos":"val-neg"} fw-bold">${totals[pid]>=0?"+":""}${totals[pid].toFixed(2)} CHF</td>`).join("")}
+            <td></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
+  <!-- Edit Cell Modal -->
+  <div class="modal-overlay" id="edit-modal" style="display:none">
+    <div class="modal" style="max-width:320px">
+      <div class="modal-header"><h2>Ergebnis eintragen</h2><button onclick="closeModal('edit-modal')">✕</button></div>
+      <p id="edit-modal-label" style="color:var(--sub);margin-bottom:12px;font-size:14px"></p>
+      <div class="form-group">
+        <label>Betrag (CHF)</label>
+        <input id="edit-val" type="number" step="0.01" placeholder="z.B. 25.50 oder -10" />
+      </div>
+      <div id="edit-error" class="alert alert-error" style="display:none"></div>
+      <div class="modal-actions" style="flex-direction:column;gap:8px">
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-muted" style="flex:1" onclick="closeModal('edit-modal')">Abbrechen</button>
+          <button class="btn btn-primary" style="flex:1" onclick="saveEdit()">Speichern</button>
+        </div>
+        <button class="btn btn-muted btn-full" onclick="saveNotPlayed()">Nicht gespielt</button>
+      </div>
+    </div>
+  </div>
+  `;
+}
+
+let editState = null;
+window.startEdit = (gameId, playerId, currentVal) => {
+  editState = { gameId, playerId };
+  const lbl = document.getElementById("edit-modal-label");
+  if (lbl) lbl.textContent = `Spieler: ${uname(playerId)}`;
+  const inp = document.getElementById("edit-val");
+  if (inp) inp.value = currentVal !== null ? currentVal : "";
+  showModal("edit-modal");
+  setTimeout(() => inp?.focus(), 100);
+};
+
+window.saveEdit = async () => {
+  if (!editState) return;
+  const inp = document.getElementById("edit-val");
+  const errEl = document.getElementById("edit-error");
+  const v = parseFloat(inp.value.replace(",","."));
+  if (isNaN(v)) { errEl.textContent = "Bitte eine gültige Zahl eingeben."; errEl.style.display="flex"; return; }
+  await commitResult(editState.gameId, editState.playerId, v);
+  closeModal("edit-modal");
+  editState = null;
+};
+
+window.saveNotPlayed = async () => {
+  if (!editState) return;
+  await commitResult(editState.gameId, editState.playerId, null);
+  closeModal("edit-modal");
+  editState = null;
+};
+
+async function commitResult(gameId, playerId, value) {
+  const s = currentSession;
+  const games = (s.games||[]).map(g => {
+    if (g.id !== gameId) return g;
+    const results = { ...(g.results||{}), [playerId]: value };
+    return { ...g, results };
+  });
+  await updateDoc(doc(db, "sessions", s.id), { games });
+
+  // Check sum for admin
+  const updatedGame = games.find(g => g.id === gameId);
+  const allPids = [...(s.players||[]).filter(p=>p!=="__extern__"), ...(s.players.includes("__extern__")?["__extern__"]:[])];
+  const sum = allPids.reduce((acc,pid) => { const v=updatedGame.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; }, 0);
+  if (s.adminId === currentUser.uid && Math.abs(sum) > 0.01) {
+    const errEl = document.getElementById("table-error");
+    if (errEl) {
+      errEl.innerHTML = `<div class="alert alert-error" style="margin-bottom:14px">⚠️ Spiel vom ${fmtDate(updatedGame.date)}: Summe ergibt ${sum.toFixed(2)} CHF (sollte 0 sein). Bitte korrigieren oder Differenz extern zuweisen.</div>`;
+      setTimeout(() => { if (errEl) errEl.innerHTML = ""; }, 8000);
+    }
+  }
+}
+
+window.assignExtern = async (gameId, sum) => {
+  const s = currentSession;
+  const games = (s.games||[]).map(g => {
+    if (g.id !== gameId) return g;
+    return { ...g, results: { ...(g.results||{}), "__extern__": -sum } };
+  });
+  const players = s.players.includes("__extern__") ? s.players : [...s.players, "__extern__"];
+  await updateDoc(doc(db, "sessions", s.id), { games, players });
+};
+
+// ── Statistiken ───────────────────────────────────────────────────────
+function statistikenHTML() {
+  const s = currentSession;
+  const playerIds = (s.players||[]).filter(p => p !== "__extern__");
+
+  const stats = playerIds.map(pid => {
+    const participated = (s.games||[]).filter(g => g.results?.[pid] !== null && g.results?.[pid] !== undefined);
+    const wins = participated.filter(g => Number(g.results[pid]) > 0);
+    const losses = participated.filter(g => Number(g.results[pid]) < 0);
+    const total = participated.reduce((acc,g) => acc + Number(g.results[pid]), 0);
+    const best = participated.length ? Math.max(...participated.map(g => Number(g.results[pid]))) : 0;
+    const worst = participated.length ? Math.min(...participated.map(g => Number(g.results[pid]))) : 0;
+    const avg = participated.length ? total / participated.length : 0;
+    let streak = 0, maxStreak = 0;
+    participated.forEach(g => { if (Number(g.results[pid])>0){streak++;maxStreak=Math.max(maxStreak,streak);}else streak=0; });
+    return { id:pid, name:uname(pid), total, wins:wins.length, losses:losses.length, gamesPlayed:participated.length, winRate:participated.length?Math.round(wins.length/participated.length*100):0, best, worst, avg, maxStreak };
+  }).sort((a,b) => b.total - a.total);
+
+  if (!stats.length) return `<div class="card"><div class="empty-state">Noch keine Statistiken verfügbar.</div></div>`;
+
+  return `
+  <div class="stats-grid">
+    ${stats.map((st,i) => `
+    <div class="card stats-card">
+      <div class="stats-header">
+        <span class="stats-rank">${["🥇","🥈","🥉"][i]||"🃏"}</span>
+        <div>
+          <div class="stats-name">${esc(st.name)}</div>
+          <div class="stats-total ${st.total>=0?"val-pos":"val-neg"}">${fmt(st.total)}</div>
+        </div>
+      </div>
+      <div class="stats-grid2">
+        ${[["🎮 Spiele",st.gamesPlayed],["🏆 Siege",st.wins],["💔 Niederlagen",st.losses],["📊 Siegquote",`${st.winRate}%`],
+           ["📈 Bestes Spiel",`${st.best>=0?"+":""}${st.best.toFixed(2)} CHF`],["📉 Schlechtestes",`${st.worst.toFixed(2)} CHF`],
+           ["⌀ Ø pro Spiel",`${st.avg>=0?"+":""}${st.avg.toFixed(2)} CHF`],["🔥 Längste Serie",`${st.maxStreak} Siege`]
+          ].map(([l,v]) => `<div class="stat-box"><div class="stat-label">${l}</div><div class="stat-val">${v}</div></div>`).join("")}
+      </div>
+    </div>`).join("")}
+  </div>`;
+}
+
+// ── CSV Export / Import ───────────────────────────────────────────────
+window.exportCSV = () => {
+  const s = currentSession;
+  if (!s) return;
+  const playerIds = (s.players||[]).filter(p => p !== "__extern__");
+  if (s.players.includes("__extern__")) playerIds.push("__extern__");
+  const names = playerIds.map(uname);
+  let csv = "Spiel;Datum;" + names.join(";") + "\n";
+  (s.games||[]).forEach((g,i) => {
+    const row = [`Spiel ${i+1}`, fmtDate(g.date)];
+    playerIds.forEach(pid => { const v=g.results?.[pid]; row.push(v===null||v===undefined?"–":v); });
+    csv += row.join(";") + "\n";
+  });
+  const tots = ["Total",""];
+  playerIds.forEach(pid => { tots.push((s.games||[]).reduce((acc,g)=>{ const v=g.results?.[pid]; return v!==null&&v!==undefined?acc+Number(v):acc; },0).toFixed(2)); });
+  csv += tots.join(";");
+  const blob = new Blob(["\uFEFF"+csv], { type:"text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href=url; a.download=`poker_${s.name.replace(/\s/g,"_")}.csv`; a.click();
+  URL.revokeObjectURL(url);
+};
+
+window.downloadTemplate = () => {
+  const csv = "Datum;Spieler1;Spieler2;Spieler3\n01.01.2024;10;-5;-5\n15.01.2024;-20;15;5";
+  const blob = new Blob(["\uFEFF"+csv],{type:"text/csv;charset=utf-8;"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href=url; a.download="poker_import_template.csv"; a.click();
+  URL.revokeObjectURL(url);
+};
+
+let importData = null;
+window.previewImport = () => {
+  const f = document.getElementById("imp-file")?.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    const text = ev.target.result.replace(/^\uFEFF/,"");
+    const lines = text.split("\n").map(l=>l.trim()).filter(Boolean);
+    if (lines.length < 2) return;
+    const sep = lines[0].includes(";") ? ";" : ",";
+    const headers = lines[0].split(sep);
+    const playerNames = headers.slice(1);
+    const games = lines.slice(1).map(line => {
+      const cols = line.split(sep);
+      const results = {};
+      playerNames.forEach((p,j) => { const v=parseFloat(cols[j+1]); results[p] = isNaN(v)?null:v; });
+      return { date: cols[0], results };
+    });
+    importData = { playerNames, games };
+    document.getElementById("imp-preview").innerHTML = `
+      <p style="color:var(--sub);font-size:13px;margin:10px 0 6px">${games.length} Spiele, ${playerNames.length} Spieler erkannt.</p>
+    `;
+  };
+  reader.readAsText(f, "UTF-8");
+};
+
+window.doImport = async () => {
+  const name = document.getElementById("imp-name")?.value.trim();
+  const errEl = document.getElementById("imp-error");
+  if (!name) { errEl.textContent="Bitte Session-Name eingeben."; errEl.style.display="flex"; return; }
+  if (!importData) { errEl.textContent="Bitte eine Datei wählen."; errEl.style.display="flex"; return; }
+  const userDoc = await getDoc(doc(db, "users", currentUser.uid));
+  if (userDoc.data()?.activeSession) { errEl.textContent="Du bist bereits in einer Session."; errEl.style.display="flex"; return; }
+
+  // Create ghost user docs for imported names (skip existing)
+  const playerIds = await Promise.all(importData.playerNames.map(async pname => {
+    const q2 = query(collection(db, "users"), where("username","==",pname));
+    const snap = await new Promise(res => onSnapshot(q2, s => res(s), {once:true}));
+    if (!snap.empty) return snap.docs[0].id;
+    const id = genId();
+    await setDoc(doc(db,"users",id), { uid:id, username:pname, ghost:true, createdAt:new Date().toISOString() });
+    allUsersCache[id] = { username: pname };
+    return id;
+  }));
+
+  const sessId = genId();
+  const games = importData.games.map(g => {
+    const results = {};
+    importData.playerNames.forEach((name,i) => { results[playerIds[i]] = g.results[name]; });
+    return { id:genId(), date:new Date().toISOString(), results };
+  });
+
+  await setDoc(doc(db,"sessions",sessId), {
+    id:sessId, name, code:genCode(), adminId:currentUser.uid,
+    players:[currentUser.uid, ...playerIds.filter(id=>id!==currentUser.uid)],
+    games, createdAt:new Date().toISOString(), active:true
+  });
+  await updateDoc(doc(db,"users",currentUser.uid), { activeSession:sessId });
+  closeModal("import-modal");
+  enterSession(sessId);
+};
+
+// ── Utils ─────────────────────────────────────────────────────────────
+function esc(str) { return String(str||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+window.showModal = id => { const el = document.getElementById(id); if (el) el.style.display="flex"; };
+window.closeModal = id => { const el = document.getElementById(id); if (el) el.style.display="none"; };
+
+window.toggleDark = () => {
+  darkMode = !darkMode;
+  localStorage.setItem("pk_dark", darkMode);
+  applyTheme();
+  const cur = document.querySelector(".tab-btn.active")?.dataset?.tab;
+  if (currentSession) renderSessionShell(cur||"uebersicht");
+  else showLobby();
+};
+
+function bindEvents() {
+  document.querySelectorAll(".modal-overlay").forEach(el => {
+    el.addEventListener("click", e => { if (e.target === el) el.style.display="none"; });
+  });
+  // Enter key on auth inputs
+  document.querySelectorAll("#f-username, #f-password, #f-email").forEach(inp => {
+    inp?.addEventListener("keydown", e => { if (e.key==="Enter") { const mode = document.getElementById("ts-register")?.classList.contains("active")?"register":"login"; doAuth(mode); } });
+  });
+  loadMySessions();
+}
+
+function bindSessionEvents() {
+  document.querySelectorAll(".modal-overlay").forEach(el => {
+    el.addEventListener("click", e => { if (e.target === el) el.style.display="none"; });
+  });
+  // Enter key in edit modal
+  document.getElementById("edit-val")?.addEventListener("keydown", e => { if (e.key==="Enter") saveEdit(); });
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+applyTheme();
+</script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { font-size: 16px; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh; transition: background .3s, color .3s;
+  }
+  h1,h2,h3 { font-family: 'Playfair Display', serif; }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: var(--surface); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* ── Layout ── */
+  #app { min-height: 100vh; }
+  .page-wrap { min-height: 100vh; }
+  .lobby-content { max-width: 720px; margin: 0 auto; padding: 28px 20px; }
+  .tab-content { max-width: 1140px; margin: 0 auto; padding: 28px 20px; }
+
+  /* ── Topbar ── */
+  .topbar {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 13px 24px; display: flex; justify-content: space-between;
+    align-items: center; position: sticky; top: 0; z-index: 100;
+    backdrop-filter: blur(12px);
+  }
+  .topbar-left { display: flex; align-items: center; gap: 12px; }
+  .topbar-right { display: flex; align-items: center; gap: 8px; }
+  .logo-sm { font-size: 22px; }
+  .logo-text { font-family: 'Playfair Display',serif; font-size: 24px; font-weight: 900; color: var(--accent); letter-spacing: -1px; }
+  .logo-text-sm { font-family: 'Playfair Display',serif; font-size: 18px; font-weight: 800; color: var(--accent); }
+  .session-title { font-family: 'Playfair Display',serif; font-weight: 800; font-size: 17px; color: var(--accent); }
+  .session-code { color: var(--muted); font-size: 12px; margin-left: 10px; }
+  .session-code strong { color: var(--text); letter-spacing: 2px; }
+  .username-label { color: var(--muted); font-size: 13px; }
+
+  /* ── Tabs ── */
+  .tabs {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; padding: 0 24px; overflow-x: auto;
+  }
+  .tab-btn {
+    padding: 14px 18px; background: none; border: none; cursor: pointer;
+    color: var(--muted); font-family: 'DM Sans',sans-serif; font-weight: 500; font-size: 14px;
+    border-bottom: 2px solid transparent; transition: all .15s; white-space: nowrap;
+  }
+  .tab-btn.active { color: var(--accent); font-weight: 700; border-bottom-color: var(--accent); }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+
+  /* ── Buttons ── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 10px 22px; border-radius: 7px; border: none; cursor: pointer;
+    font-family: 'DM Sans',sans-serif; font-size: 14px; font-weight: 600;
+    transition: all .15s; letter-spacing: .2px; white-space: nowrap;
+  }
+  .btn-sm { padding: 7px 15px; font-size: 13px; }
+  .btn-full { width: 100%; }
+  .btn-primary { background: var(--accent); color: #0d0a05; }
+  .btn-primary:hover { background: var(--accent-d); }
+  .btn-ghost { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
+  .btn-ghost:hover { background: var(--accent); color: #0d0a05; }
+  .btn-danger { background: var(--red); color: #fff; }
+  .btn-danger:hover { filter: brightness(0.88); }
+  .btn-muted { background: var(--surface); color: var(--sub); border: 1px solid var(--border); }
+  .btn-muted:hover { background: var(--border); }
+  .link-btn { background: none; border: none; cursor: pointer; color: var(--accent); font-family: inherit; text-decoration: underline; padding: 0; }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 22px; margin-bottom: 0;
+  }
+  .card-title { font-size: 16px; font-weight: 700; color: var(--accent); margin-bottom: 16px; font-family: 'Playfair Display',serif; }
+
+  /* ── Auth ── */
+  .auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .auth-box { width: 100%; max-width: 420px; }
+  .auth-logo { text-align: center; margin-bottom: 36px; }
+  .logo-icon { font-size: 56px; margin-bottom: 10px; }
+  .logo-sub { color: var(--muted); font-size: 14px; margin-top: 6px; }
+  .tab-switch { display: flex; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 4px; margin-bottom: 22px; }
+  .ts-btn { flex: 1; padding: 9px 0; border-radius: 6px; border: none; cursor: pointer; background: transparent; color: var(--muted); font-family: 'DM Sans',sans-serif; font-weight: 600; font-size: 14px; transition: all .2s; }
+  .ts-btn.active { background: var(--card); color: var(--accent); }
+
+  /* ── Forms ── */
+  .form-group { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+  .form-group label { font-size: 11px; color: var(--muted); letter-spacing: .6px; text-transform: uppercase; font-weight: 600; }
+  .form-group input, .form-group select {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 7px;
+    padding: 10px 14px; color: var(--text); font-size: 14px; font-family: 'DM Sans',sans-serif;
+    outline: none; transition: border .15s;
+  }
+  .form-group input:focus { border-color: var(--accent); }
+  .form-group input[type="file"] { padding: 8px; }
+
+  /* ── Alerts ── */
+  .alert { display: flex; align-items: flex-start; gap: 10px; padding: 11px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 4px; }
+  .alert::before { content: "⚠️"; flex-shrink: 0; }
+  .alert-error { background: color-mix(in srgb, var(--red) 12%, transparent); border: 1px solid color-mix(in srgb, var(--red) 30%, transparent); color: var(--red); }
+  .alert-warning { background: color-mix(in srgb, var(--accent) 12%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); color: var(--accent); }
+
+  /* ── Badges ── */
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 11px; font-weight: 700; letter-spacing: .4px; background: var(--accent-soft); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+  .badge-red { background: color-mix(in srgb, var(--red) 12%, transparent); color: var(--red); border-color: color-mix(in srgb, var(--red) 30%, transparent); }
+  .badge-green { background: color-mix(in srgb, var(--green) 12%, transparent); color: var(--green); border-color: color-mix(in srgb, var(--green) 30%, transparent); }
+  .badge-me { display: inline-block; padding: 1px 7px; border-radius: 99px; font-size: 10px; font-weight: 700; background: var(--accent-soft); color: var(--accent); margin-left: 5px; }
+
+  /* ── Modal ── */
+  .modal-overlay { position: fixed; inset: 0; background: #00000088; z-index: 1000; display: flex; align-items: center; justify-content: center; padding: 20px; }
+  .modal { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 28px; width: 100%; max-width: 460px; max-height: 90vh; overflow-y: auto; animation: fadeUp .2s ease; }
+  .modal-wide { max-width: 680px; }
+  .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; }
+  .modal-header h2 { font-size: 19px; color: var(--accent); }
+  .modal-header button { background: none; border: none; color: var(--muted); font-size: 20px; cursor: pointer; line-height: 1; }
+  .modal-actions { display: flex; gap: 10px; margin-top: 16px; }
+
+  /* ── Lobby ── */
+  .lobby-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 20px; }
+  .lobby-card { text-align: center; cursor: pointer; transition: border-color .2s; }
+  .lobby-card:hover { border-color: var(--accent); }
+  .lobby-icon { font-size: 34px; margin-bottom: 8px; }
+  .lobby-card h3 { color: var(--accent); margin-bottom: 6px; font-size: 15px; }
+  .lobby-card p { color: var(--muted); font-size: 13px; }
+  .section-title { font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: .6px; text-transform: uppercase; margin-bottom: 10px; font-family: 'DM Sans',sans-serif; }
+  .session-row { display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; margin-bottom: 10px; }
+  .session-row-name { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; margin-bottom: 4px; }
+  .session-row-meta { color: var(--muted); font-size: 13px; }
+  .code-pill { color: var(--accent); letter-spacing: 2px; font-size: 14px; }
+
+  /* ── Admin bar ── */
+  .admin-bar { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+  .admin-bar-title { font-weight: 700; margin-bottom: 2px; }
+  .admin-bar-sub { color: var(--muted); font-size: 13px; }
+  .admin-bar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ── Overview Grid ── */
+  .overview-grid { display: grid; grid-template-columns: minmax(260px, 1fr) 2fr; gap: 16px; margin-bottom: 16px; }
+  .leaderboard { display: flex; flex-direction: column; gap: 8px; }
+  .lb-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface); border-radius: 8px; border: 1px solid var(--border); }
+  .lb-first { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .lb-rank { font-size: 18px; width: 28px; }
+  .lb-name { flex: 1; font-weight: 600; }
+  .lb-val { font-weight: 700; }
+  .recent-row { display: flex; align-items: center; gap: 12px; padding: 10px 14px; background: var(--surface); border-radius: 8px; margin-bottom: 7px; }
+  .recent-date { color: var(--muted); font-size: 13px; width: 85px; flex-shrink: 0; }
+  .recent-info { flex: 1; font-size: 13px; color: var(--sub); }
+
+  /* ── Table ── */
+  .table-card { padding: 0; overflow: hidden; }
+  .table-scroll { overflow-x: auto; }
+  .results-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .results-table th { padding: 13px 12px; text-align: center; color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; border-bottom: 2px solid var(--border); white-space: nowrap; background: var(--surface); font-family: 'DM Sans',sans-serif; }
+  .results-table th:first-child, .results-table th:nth-child(2) { text-align: left; padding-left: 18px; }
+  .results-table td { padding: 10px 12px; text-align: center; border-bottom: 1px solid var(--border); }
+  .results-table td:first-child, .results-table td:nth-child(2) { text-align: left; padding-left: 18px; }
+  .results-table tbody tr:hover { background: var(--surface); }
+  .row-err { background: color-mix(in srgb, var(--red) 5%, transparent) !important; }
+  .td-spiel { font-weight: 600; color: var(--sub); white-space: nowrap; }
+  .td-date { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .td-sum { white-space: nowrap; }
+  .sum-err { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .muted-label { color: var(--muted); font-size: 11px; }
+  .cell-wrap { display: inline-flex; align-items: center; justify-content: center; min-width: 75px; padding: 5px 8px; border-radius: 6px; border: 1px solid transparent; }
+  .cell-editable { border-style: dashed; border-color: var(--border); cursor: pointer; transition: all .12s; }
+  .cell-editable:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .val-none { color: var(--muted); font-size: 12px; }
+  .val-pos { color: var(--green); font-weight: 700; }
+  .val-neg { color: var(--red); font-weight: 700; }
+  .fw-bold { font-weight: 800; }
+  .total-row td { padding: 13px 12px; font-weight: 800; color: var(--accent); background: var(--surface); font-family: 'Playfair Display',serif; font-size: 13px; }
+  .total-row td:first-child { padding-left: 18px; }
+
+  /* ── Stats ── */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; }
+  .stats-card { }
+  .stats-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .stats-rank { font-size: 26px; }
+  .stats-name { font-weight: 800; font-size: 16px; font-family: 'Playfair Display',serif; }
+  .stats-total { font-weight: 700; font-size: 15px; margin-top: 2px; }
+  .stats-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-box { background: var(--surface); border-radius: 7px; padding: 10px 12px; }
+  .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+  .stat-val { font-weight: 700; font-size: 14px; }
+
+  /* ── Misc ── */
+  .empty-state { text-align: center; padding: 50px 20px; color: var(--muted); }
+
+  /* ── Animations ── */
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+
+  /* ── Responsive ── */
+  @media (max-width: 640px) {
+    .overview-grid { grid-template-columns: 1fr; }
+    .lobby-grid { grid-template-columns: 1fr; }
+    .topbar { padding: 10px 14px; }
+    .tab-content { padding: 16px 12px; }
+    .admin-bar { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+
+</head>
+<body>
+<div id="app">
+  <div style="display:flex;align-items:center;justify-content:center;min-height:100vh;color:var(--muted);font-family:'DM Sans',sans-serif">
+    Wird geladen…
+  </div>
+</div>
+</body>
+</html>
