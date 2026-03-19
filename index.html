@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html lang="de">
 <head>
 <meta charset="UTF-8" />
@@ -14,7 +13,6 @@
      Ersetze die Werte unten mit deinen Firebase-Projektdaten.
      Anleitung: siehe README am Ende der Seite (Konsole öffnen)
 ════════════════════════════════════════════════════════════ -->
-
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile }
@@ -89,17 +87,10 @@ function applyTheme() {
 onAuthStateChanged(auth, async user => {
   if (user) {
     currentUser = user;
-    // Cache user profile
     const snap = await getDoc(doc(db, "users", user.uid));
     if (snap.exists()) allUsersCache[user.uid] = snap.data();
-    // Check if in a session
-    const sessSnap = await getDoc(doc(db, "users", user.uid));
-    const activeSession = sessSnap.exists() ? sessSnap.data().activeSession : null;
-    if (activeSession) {
-      enterSession(activeSession);
-    } else {
-      showLobby();
-    }
+    // Always go to lobby - user picks session themselves
+    showLobby();
   } else {
     currentUser = null;
     currentSession = null;
@@ -210,8 +201,8 @@ function authPage() {
 
 function authForm(mode) {
   return `
-    <div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>
-    ${mode==="register" ? `<div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" /></div>` : ""}
+    ${mode==="register" ? `<div class="form-group"><label>Benutzername</label><input id="f-username" type="text" placeholder="dein_name" autocomplete="username" /></div>` : ""}
+    <div class="form-group"><label>E-Mail</label><input id="f-email" type="email" placeholder="du@beispiel.ch" autocomplete="email" /></div>
     <div class="form-group"><label>Passwort</label><input id="f-password" type="password" placeholder="••••••" autocomplete="${mode==="login"?"current":"new"}-password" /></div>
     <div id="auth-error" class="alert alert-error" style="display:none"></div>
     <button class="btn btn-primary btn-full" onclick="doAuth('${mode}')">
@@ -245,25 +236,50 @@ window.doAuth = async (mode) => {
     try {
       const cred = await createUserWithEmailAndPassword(auth, email, password);
       await updateProfile(cred.user, { displayName: username });
-      await setDoc(doc(db, "users", cred.user.uid), { uid: cred.user.uid, username, email, createdAt: new Date().toISOString(), activeSession: null });
+
+      // Check if a ghost user with same username exists -> merge sessions
+      const ghostQ = query(collection(db, "users"), where("username","==",username), where("ghost","==",true));
+      const ghostSnap = await new Promise(res => onSnapshot(ghostQ, s => res(s), {once:true}));
+      if (!ghostSnap.empty) {
+        const ghostId = ghostSnap.docs[0].id;
+        // Find all sessions containing the ghost user and replace ghost ID with real user ID
+        const sessQ = query(collection(db, "sessions"), where("players","array-contains",ghostId));
+        const sessSnap = await new Promise(res => onSnapshot(sessQ, s => res(s), {once:true}));
+        for (const sessDoc of sessSnap.docs) {
+          const sess = sessDoc.data();
+          // Replace ghostId in players array
+          const newPlayers = sess.players.map(p => p === ghostId ? cred.user.uid : p);
+          // Replace ghostId in all game results
+          const newGames = (sess.games||[]).map(g => {
+            if (g.results && g.results[ghostId] !== undefined) {
+              const newResults = { ...g.results };
+              newResults[cred.user.uid] = newResults[ghostId];
+              delete newResults[ghostId];
+              return { ...g, results: newResults };
+            }
+            return g;
+          });
+          // Fix adminId if ghost was admin
+          const newAdmin = sess.adminId === ghostId ? cred.user.uid : sess.adminId;
+          await updateDoc(doc(db, "sessions", sessDoc.id), { players: newPlayers, games: newGames, adminId: newAdmin });
+        }
+        // Delete ghost user doc
+        await deleteDoc(doc(db, "users", ghostId));
+      }
+
+      await setDoc(doc(db, "users", cred.user.uid), { uid: cred.user.uid, username, email, createdAt: new Date().toISOString() });
     } catch(e) {
       if (e.code === "auth/email-already-in-use") return showErr("E-Mail bereits registriert.");
       return showErr("Fehler: " + e.message);
     }
   } else {
-    // Login: find email by username
+    // Login with email
+    const email = document.getElementById("f-email")?.value.trim() || "";
+    if (!email) return showErr("Bitte E-Mail eingeben.");
     try {
-      const usersSnap = await new Promise((res) => {
-        const q = query(collection(db, "users"), where("username", "==", username));
-        onSnapshot(q, snap => res(snap), { once: true });
-      });
-      // Since we can't easily query by username on login without email,
-      // store email in local cache or require email
-      // Workaround: ask for email on login too if username not found
-      const email = prompt(`E-Mail für "${username}":`) || "";
       await signInWithEmailAndPassword(auth, email, password);
     } catch(e) {
-      return showErr("Benutzername oder Passwort falsch.");
+      return showErr("E-Mail oder Passwort falsch.");
     }
   }
 };
@@ -384,15 +400,12 @@ window.createSession = async () => {
   const name = document.getElementById("cs-name")?.value.trim();
   const errEl = document.getElementById("cs-error");
   if (!name) { errEl.textContent = "Bitte einen Namen eingeben."; errEl.style.display="flex"; return; }
-  const userDoc = await getDoc(doc(db, "users", currentUser.uid));
-  if (userDoc.data()?.activeSession) { errEl.textContent = "Du bist bereits in einer Session."; errEl.style.display="flex"; return; }
   const id = genId();
   const code = genCode();
   await setDoc(doc(db, "sessions", id), {
     id, name, code, adminId: currentUser.uid, players: [currentUser.uid],
     games: [], createdAt: new Date().toISOString(), active: true
   });
-  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: id });
   closeModal("create-session-modal");
   enterSession(id);
 };
@@ -400,23 +413,25 @@ window.createSession = async () => {
 window.joinSession = async () => {
   const code = document.getElementById("jc-code")?.value.trim().toUpperCase();
   const errEl = document.getElementById("jc-error");
-  const userDoc = await getDoc(doc(db, "users", currentUser.uid));
-  if (userDoc.data()?.activeSession) { errEl.textContent = "Du bist bereits in einer Session. Verlasse sie zuerst."; errEl.style.display="flex"; return; }
+  if (!code) { errEl.textContent = "Bitte einen Code eingeben."; errEl.style.display="flex"; return; }
   const q2 = query(collection(db, "sessions"), where("code", "==", code), where("active", "==", true));
   const snap = await new Promise(res => onSnapshot(q2, s => res(s), { once: true }));
   if (snap.empty) { errEl.textContent = "Ungültiger Code oder Session nicht aktiv."; errEl.style.display="flex"; return; }
   const sessDoc = snap.docs[0];
   const sess = sessDoc.data();
-  if ((sess.players||[]).includes(currentUser.uid)) { errEl.textContent = "Du bist bereits in dieser Session."; errEl.style.display="flex"; return; }
+  if ((sess.players||[]).includes(currentUser.uid)) {
+    // Already in session - just open it
+    closeModal("join-session-modal");
+    enterSession(sessDoc.id);
+    return;
+  }
   await updateDoc(doc(db, "sessions", sessDoc.id), { players: arrayUnion(currentUser.uid) });
-  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: sessDoc.id });
   closeModal("join-session-modal");
   enterSession(sessDoc.id);
 };
 
-window.leaveSession = async () => {
+window.leaveSession = () => {
   if (unsubSession) { unsubSession(); unsubSession = null; }
-  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: null });
   currentSession = null; currentSessionId = null;
   showLobby();
 };
@@ -565,7 +580,6 @@ window.deleteSession = async () => {
   if (!confirm("Session wirklich löschen? Alle Daten gehen verloren.")) return;
   if (unsubSession) { unsubSession(); unsubSession = null; }
   await deleteDoc(doc(db, "sessions", currentSessionId));
-  await updateDoc(doc(db, "users", currentUser.uid), { activeSession: null });
   currentSession = null; currentSessionId = null;
   showLobby();
 };
@@ -793,22 +807,39 @@ window.previewImport = () => {
   if (!f) return;
   const reader = new FileReader();
   reader.onload = ev => {
-    const text = ev.target.result.replace(/^\uFEFF/,"");
-    const lines = text.split("\n").map(l=>l.trim()).filter(Boolean);
-    if (lines.length < 2) return;
-    const sep = lines[0].includes(";") ? ";" : ",";
-    const headers = lines[0].split(sep);
-    const playerNames = headers.slice(1);
-    const games = lines.slice(1).map(line => {
-      const cols = line.split(sep);
-      const results = {};
-      playerNames.forEach((p,j) => { const v=parseFloat(cols[j+1]); results[p] = isNaN(v)?null:v; });
-      return { date: cols[0], results };
-    });
-    importData = { playerNames, games };
-    document.getElementById("imp-preview").innerHTML = `
-      <p style="color:var(--sub);font-size:13px;margin:10px 0 6px">${games.length} Spiele, ${playerNames.length} Spieler erkannt.</p>
-    `;
+    try {
+      const text = ev.target.result.replace(/^\uFEFF/,"").replace(/\r/g,"");
+      const lines = text.split("\n").map(l=>l.trim()).filter(Boolean);
+      if (lines.length < 2) {
+        document.getElementById("imp-preview").innerHTML = `<p style="color:var(--red);font-size:13px;margin-top:8px">⚠️ Datei hat zu wenig Zeilen.</p>`;
+        return;
+      }
+      // Auto-detect separator
+      const sep = lines[0].includes(";") ? ";" : ",";
+      const headers = lines[0].split(sep).map(h => h.trim());
+      const playerNames = headers.slice(1).filter(Boolean);
+      const games = lines.slice(1).map(line => {
+        const cols = line.split(sep).map(c => c.trim());
+        const results = {};
+        playerNames.forEach((p,j) => {
+          const raw = cols[j+1]?.replace(",",".");
+          const v = parseFloat(raw);
+          results[p] = isNaN(v) ? null : v;
+        });
+        return { date: cols[0], results };
+      }).filter(g => Object.keys(g.results).length > 0);
+
+      importData = { playerNames, games };
+      document.getElementById("imp-preview").innerHTML = `
+        <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:10px">
+          <p style="color:var(--green);font-size:13px;font-weight:700;margin-bottom:8px">✅ ${games.length} Spiele und ${playerNames.length} Spieler erkannt</p>
+          <p style="color:var(--sub);font-size:12px;margin-bottom:4px">Spieler: ${playerNames.map(p=>`<strong>${esc(p)}</strong>`).join(", ")}</p>
+          <p style="color:var(--muted);font-size:11px;margin-top:6px">Erstes Spiel: ${games[0]?.date || "–"} · Letztes: ${games[games.length-1]?.date || "–"}</p>
+        </div>
+      `;
+    } catch(e) {
+      document.getElementById("imp-preview").innerHTML = `<p style="color:var(--red);font-size:13px;margin-top:8px">⚠️ Fehler beim Lesen der Datei: ${e.message}</p>`;
+    }
   };
   reader.readAsText(f, "UTF-8");
 };
@@ -816,37 +847,73 @@ window.previewImport = () => {
 window.doImport = async () => {
   const name = document.getElementById("imp-name")?.value.trim();
   const errEl = document.getElementById("imp-error");
+  errEl.style.display = "none";
   if (!name) { errEl.textContent="Bitte Session-Name eingeben."; errEl.style.display="flex"; return; }
-  if (!importData) { errEl.textContent="Bitte eine Datei wählen."; errEl.style.display="flex"; return; }
-  const userDoc = await getDoc(doc(db, "users", currentUser.uid));
-  if (userDoc.data()?.activeSession) { errEl.textContent="Du bist bereits in einer Session."; errEl.style.display="flex"; return; }
+  if (!importData) { errEl.textContent="Bitte zuerst eine Datei hochladen."; errEl.style.display="flex"; return; }
+  if (importData.games.length === 0) { errEl.textContent="Keine Spiele in der Datei gefunden."; errEl.style.display="flex"; return; }
 
-  // Create ghost user docs for imported names (skip existing)
-  const playerIds = await Promise.all(importData.playerNames.map(async pname => {
-    const q2 = query(collection(db, "users"), where("username","==",pname));
-    const snap = await new Promise(res => onSnapshot(q2, s => res(s), {once:true}));
-    if (!snap.empty) return snap.docs[0].id;
-    const id = genId();
-    await setDoc(doc(db,"users",id), { uid:id, username:pname, ghost:true, createdAt:new Date().toISOString() });
-    allUsersCache[id] = { username: pname };
-    return id;
-  }));
+  // Show loading state
+  const btn = document.querySelector("#import-modal .btn-primary");
+  if (btn) { btn.textContent = "Wird importiert..."; btn.disabled = true; }
 
-  const sessId = genId();
-  const games = importData.games.map(g => {
-    const results = {};
-    importData.playerNames.forEach((name,i) => { results[playerIds[i]] = g.results[name]; });
-    return { id:genId(), date:new Date().toISOString(), results };
-  });
+  try {
+    // For each player name: check if a real or ghost user with that name exists
+    const playerIds = await Promise.all(importData.playerNames.map(async pname => {
+      const trimmed = pname.trim();
+      if (!trimmed) return null;
+      // Use getDocs-style via getDoc workaround: query then get first result
+      const q2 = query(collection(db, "users"), where("username","==",trimmed));
+      const snap = await new Promise((res, rej) => {
+        const unsub = onSnapshot(q2, s => { unsub(); res(s); }, rej);
+      });
+      if (!snap.empty) {
+        allUsersCache[snap.docs[0].id] = snap.docs[0].data();
+        return snap.docs[0].id;
+      }
+      // Create ghost user
+      const id = genId();
+      await setDoc(doc(db,"users",id), { uid:id, username:trimmed, ghost:true, createdAt:new Date().toISOString() });
+      allUsersCache[id] = { username: trimmed };
+      return id;
+    }));
 
-  await setDoc(doc(db,"sessions",sessId), {
-    id:sessId, name, code:genCode(), adminId:currentUser.uid,
-    players:[currentUser.uid, ...playerIds.filter(id=>id!==currentUser.uid)],
-    games, createdAt:new Date().toISOString(), active:true
-  });
-  await updateDoc(doc(db,"users",currentUser.uid), { activeSession:sessId });
-  closeModal("import-modal");
-  enterSession(sessId);
+    const validPlayerIds = playerIds.filter(Boolean);
+    const sessId = genId();
+    const sessionName = name;
+
+    const games = importData.games.map(g => {
+      const results = {};
+      importData.playerNames.forEach((pname, i) => {
+        if (playerIds[i]) results[playerIds[i]] = g.results[pname.trim()];
+      });
+      // Try to parse date from CSV, fallback to now
+      let dateStr = new Date().toISOString();
+      if (g.date) {
+        const parts = g.date.split(".");
+        if (parts.length === 3) {
+          const parsed = new Date(`${parts[2]}-${parts[1]}-${parts[0]}`);
+          if (!isNaN(parsed)) dateStr = parsed.toISOString();
+        }
+      }
+      return { id:genId(), date:dateStr, results };
+    });
+
+    // Ensure current user is in players list
+    const allPlayers = [currentUser.uid, ...validPlayerIds.filter(id => id !== currentUser.uid)];
+
+    await setDoc(doc(db,"sessions",sessId), {
+      id:sessId, name:sessionName, code:genCode(), adminId:currentUser.uid,
+      players:allPlayers, games, createdAt:new Date().toISOString(), active:true
+    });
+
+    importData = null;
+    closeModal("import-modal");
+    enterSession(sessId);
+  } catch(e) {
+    errEl.textContent = "Fehler beim Import: " + e.message;
+    errEl.style.display = "flex";
+    if (btn) { btn.textContent = "Importieren"; btn.disabled = false; }
+  }
 };
 
 // ── Utils ─────────────────────────────────────────────────────────────
@@ -1089,7 +1156,6 @@ applyTheme();
     .admin-bar { flex-direction: column; align-items: flex-start; }
   }
 </style>
-
 </head>
 <body>
 <div id="app">
